@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sigma-csv-data-model-migrator"
+version = "0.1.0"
+description = "Migrate Sigma CSV-backed data models between organizations without re-uploading warehouse data"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/twells89/sigma-csv-data-model-migrator"
+
+[project.scripts]
+sigma-csv-dm-migrate = "migrate_csv_data_model:main"
+
+[tool.setuptools]
+py-modules = ["migrate_csv_data_model"]
+package-dir = {"" = "scripts"}
