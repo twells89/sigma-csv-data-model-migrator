@@ -6,29 +6,33 @@ Sigma stores an uploaded CSV as a hidden table in the connection's Databricks wr
 
 ## Requirements
 
-- Python 3.10 or newer; no third-party packages
-- Sigma API credentials for the source and destination organizations
+- Python 3.10 or newer; no third-party Python packages
+- [Sigma CLI](https://help.sigmacomputing.com/docs/install-and-configure-the-sigma-cli)
+- An OAuth Sigma CLI profile for each organization
 - A Databricks connection in each organization pointing to the same workspace
 - The destination connection principal must have `SELECT` access to the source write-back schema
 - Keep the source data model in place so the uploaded table remains available
 
-## Credentials
+## Authenticate with OAuth
 
-Create separate plain-text files outside the repository:
+Create one Sigma CLI profile for each organization. The CLI handles browser login, secure token storage, and refresh; this tool does not read credentials or tokens.
 
-```dotenv
-SIGMA_BASE_URL=https://<region>-api.sigmacomputing.com
-SIGMA_CLIENT_ID=<client-id>
-SIGMA_CLIENT_SECRET=<client-secret>
+```bash
+sigma auth login
+# Create OAuth profile: source-org
+
+sigma auth login
+# Create OAuth profile: target-org
+
+sigma -p source-org auth status
+sigma -p target-org auth status
 ```
-
-Do not use an RTF document. Keep credential files mode `0600` and never commit them.
 
 ## Inspect the source
 
 ```bash
 python3 scripts/migrate_csv_data_model.py inspect \
-  --source-env /secure/source.env \
+  --source-profile source-org \
   --model 'https://app.sigmacomputing.com/<org>/data-model/<model-slug>' \
   --export-spec /secure/source-model.json
 ```
@@ -56,8 +60,8 @@ Every CSV element requires one mapping. By default, the tool verifies that sourc
 
 ```bash
 python3 scripts/migrate_csv_data_model.py plan \
-  --source-env /secure/source.env \
-  --target-env /secure/target.env \
+  --source-profile source-org \
+  --target-profile target-org \
   --model '<source-model-id-or-url>' \
   --mapping /secure/source-map.json \
   --target-folder '<destination-folder-id>' \
@@ -73,8 +77,8 @@ Add both mutation gates to the reviewed planning command:
 
 ```bash
 python3 scripts/migrate_csv_data_model.py plan \
-  --source-env /secure/source.env \
-  --target-env /secure/target.env \
+  --source-profile source-org \
+  --target-profile target-org \
   --model '<source-model-id-or-url>' \
   --mapping /secure/source-map.json \
   --target-folder '<destination-folder-id>' \
@@ -87,7 +91,7 @@ The tool creates the model, reads it back, and fails if the destination still co
 
 ## How discovery works
 
-For every CSV element, the tool calls:
+For every CSV element, the tool runs the Sigma CLI equivalent of:
 
 ```text
 GET /v2/dataModels/{dataModelId}/elements/{elementId}/query
