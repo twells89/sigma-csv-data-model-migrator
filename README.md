@@ -60,15 +60,7 @@ Restart your shell after `ensurepath` if the command is not immediately availabl
 
 ### 3. Install the migrator
 
-Because this repository is private, first configure Git authentication:
-
-```bash
-gh auth login
-
-gh auth setup-git
-```
-
-Then install directly from GitHub:
+Install directly from GitHub:
 
 ```bash
 pipx install "git+https://github.com/twells89/sigma-csv-data-model-migrator.git"
@@ -173,13 +165,18 @@ The tool creates the model, reads it back, and fails if the destination still co
 
 ## How discovery works
 
-For every CSV element, the tool runs the Sigma CLI equivalent of:
+The tool supports both legacy `csv-table` elements and current CSV-backed input-table elements. For every discovered source, it first uses the data-model query operation and falls back to the equivalent workbook operation for older CLI/OpenAPI versions:
 
 ```text
 GET /v2/dataModels/{dataModelId}/elements/{elementId}/query
+GET /v2/workbooks/{workbookId}/elements/{elementId}/query
 ```
 
 Sigma's generated SQL reveals the hidden Databricks table. The tool removes Sigma's preview `LIMIT` and request comment, changes the source from `csv-table` to `sql`, rewrites source-column IDs and formulas, and preserves exact dependent column references.
+
+## Input-table snapshot behavior
+
+Current Sigma CSV uploads can be represented as writeback-backed input tables. Their generated SQL can include a `ROW_VERSION <= ...` boundary. Migrating that SQL creates a frozen snapshot at plan time: edits made later to the source input table do not automatically propagate to the destination data model. Generate a new plan and update the destination model when a newer snapshot is required.
 
 ## Development
 
@@ -189,5 +186,5 @@ Install an editable checkout and run the tests:
 git clone https://github.com/twells89/sigma-csv-data-model-migrator.git
 cd sigma-csv-data-model-migrator
 python3 -m pip install -e .
-python3 -m unittest test/test_migrate_csv_data_model.py
+python3 -m unittest discover -s test -p 'test_*.py'
 ```

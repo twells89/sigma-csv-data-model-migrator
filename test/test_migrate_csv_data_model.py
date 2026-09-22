@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import json
 import subprocess
 import sys
 import unittest
@@ -88,6 +89,15 @@ def resolved_source():
             "from analytics.writeback.sigma_df_csv_example Q1"
         ),
     )
+
+
+def input_table_entry(element_id="input-1"):
+    return {
+        "elementId": element_id,
+        "name": "Accounts",
+        "type": "input-table",
+        "columns": ["Account ID", "Account CSM"],
+    }
 
 
 class MigrationTransformTest(unittest.TestCase):
@@ -264,7 +274,7 @@ class MigrationTransformTest(unittest.TestCase):
     def test_model_url_extracts_public_id(self):
         result = MIGRATE.parse_model_ref(
             "https://app.sigmacomputing.com/example/data-model/"
-            "Regional-Sales-AbCdEf1234567890GhIjKl"
+            "Regional-Sales-AbCdEf1234567890GhIjKl/edit"
         )
         self.assertEqual(result, "AbCdEf1234567890GhIjKl")
 
@@ -304,6 +314,162 @@ class MigrationTransformTest(unittest.TestCase):
             calls[0][1],
             {"capture_output": True, "text": True, "check": False},
         )
+
+    def test_element_query_falls_back_to_workbook_operation(self):
+        calls = []
+
+        def runner(command, **_kwargs):
+            calls.append(command)
+            if "data-models" in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    stdout="",
+                    stderr="no command at path",
+                )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout='{"elementId":"element-1","sql":"select 1"}',
+                stderr="",
+            )
+
+        client = MIGRATE.SigmaCliClient("source-org", runner=runner)
+        result = client.get_element_query("model-id", "element-1")
+
+        self.assertEqual(result["elementId"], "element-1")
+        self.assertIn("data-models", calls[0])
+        self.assertIn("workbooks", calls[1])
+
+    def test_data_model_elements_are_paginated(self):
+        calls = []
+
+        def runner(command, **_kwargs):
+            params = json.loads(command[command.index("--params") + 1])
+            calls.append(params)
+            if "page" not in params:
+                payload = {
+                    "entries": [{"elementId": "first"}],
+                    "nextPage": "cursor-2",
+                }
+            else:
+                payload = {
+                    "entries": [{"elementId": "second"}],
+                    "nextPage": None,
+                }
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(payload),
+                stderr="",
+            )
+
+        client = MIGRATE.SigmaCliClient("source-org", runner=runner)
+        result = client.list_data_model_elements("model-id")
+
+        self.assertEqual(
+            [entry["elementId"] for entry in result["entries"]],
+            ["first", "second"],
+        )
+        self.assertEqual(calls[0], {"dataModelId": "model-id", "limit": 500})
+        self.assertEqual(
+            calls[1],
+            {"dataModelId": "model-id", "limit": 500, "page": "cursor-2"},
+        )
+
+    def test_input_table_only_model_is_synthesized(self):
+        class Client:
+            def get_data_model_spec(self, _model_id):
+                return {
+                    "dataModelId": "model-id",
+                    "schemaVersion": 1,
+                    "pages": [],
+                }
+
+            def list_data_model_elements(self, _model_id):
+                return {"entries": [input_table_entry()]}
+
+        spec = MIGRATE.get_spec(Client(), "model-id")
+        element = MIGRATE.csv_elements(spec)[0]
+
+        self.assertEqual(spec["pages"][0]["name"], "Input Tables")
+        self.assertEqual(element["source"]["inodeId"], "input-1")
+        self.assertEqual(
+            [column["id"] for column in element["columns"]],
+            ["input-1/Account_ID", "input-1/Account_CSM"],
+        )
+
+    def test_mixed_legacy_csv_and_input_table_are_both_synthesized(self):
+        source = source_spec()
+
+        class Client:
+            def get_data_model_spec(self, _model_id):
+                return source
+
+            def list_data_model_elements(self, _model_id):
+                return {"entries": [input_table_entry()]}
+
+        spec = MIGRATE.get_spec(Client(), "model-id")
+
+        self.assertEqual(
+            {element["id"] for element in MIGRATE.csv_elements(spec)},
+            {"csv-sales", "input-1"},
+        )
+
+    def test_input_table_still_validates_target_connection_type(self):
+        synthetic = {
+            "dataModelId": "model-id",
+            "pages": [
+                {
+                    "id": "page-1",
+                    "name": "Page 1",
+                    "elements": [
+                        {
+                            "id": "input-1",
+                            "kind": "table",
+                            "source": {
+                                "kind": "csv-table",
+                                "connectionId": None,
+                                "inodeId": "input-1",
+                            },
+                            "columns": [
+                                {
+                                    "id": "input-1/Account_ID",
+                                    "formula": "[Accounts/Account ID]",
+                                }
+                            ],
+                            "order": ["input-1/Account_ID"],
+                        }
+                    ],
+                }
+            ],
+        }
+
+        class SourceClient:
+            def get_element_query(self, _model_id, _element_id):
+                return {
+                    "sql": (
+                        "select Account_ID "
+                        "from catalog.writeback.sigma_input_table Q1 limit 1000"
+                    )
+                }
+
+        class TargetClient:
+            def get_connection(self, _connection_id):
+                return {"type": "snowflake", "host": "not-databricks"}
+
+        with self.assertRaisesRegex(MIGRATE.MigrationError, "not Databricks"):
+            MIGRATE.resolve_sources(
+                SourceClient(),
+                TargetClient(),
+                synthetic,
+                [
+                    {
+                        "sourceElementId": "input-1",
+                        "targetConnectionId": "target-connection",
+                    }
+                ],
+            )
 
 
 if __name__ == "__main__":

@@ -112,13 +112,37 @@ class SigmaCliClient:
     def get_element_query(
         self, data_model_id: str, element_id: str
     ) -> dict[str, Any]:
-        return self._run(
-            "data-models",
-            "elements",
-            "query",
-            "get",
-            params={"dataModelId": data_model_id, "elementId": element_id},
-        )
+        # Current Sigma exposes both operations. Prefer the resource-specific
+        # data-model route, then fall back for CLI/spec versions that only
+        # surface the equivalent workbook operation.
+        try:
+            return self._run(
+                "data-models",
+                "elements",
+                "query",
+                "get",
+                params={"dataModelId": data_model_id, "elementId": element_id},
+            )
+        except MigrationError as error:
+            message = str(error).casefold()
+            unavailable = any(
+                marker in message
+                for marker in (
+                    "no command at path",
+                    "unknown command",
+                    "not found",
+                    "404",
+                )
+            )
+            if not unavailable:
+                raise
+            return self._run(
+                "workbooks",
+                "elements",
+                "query",
+                "get",
+                params={"workbookId": data_model_id, "elementId": element_id},
+            )
 
     def get_connection(self, connection_id: str) -> dict[str, Any]:
         return self._run(
@@ -126,6 +150,43 @@ class SigmaCliClient:
             "get",
             params={"connectionId": connection_id},
         )
+
+    def list_data_model_elements(self, data_model_id: str) -> dict[str, Any]:
+        entries: list[dict[str, Any]] = []
+        page: str | None = None
+        seen_pages: set[str] = set()
+        while True:
+            params: dict[str, Any] = {
+                "dataModelId": data_model_id,
+                "limit": 500,
+            }
+            if page:
+                params["page"] = page
+            payload = self._run(
+                "data-models",
+                "elements",
+                "list",
+                params=params,
+            )
+            page_entries = payload.get("entries", [])
+            if not isinstance(page_entries, list):
+                raise MigrationError(
+                    "Sigma CLI data-model elements response has no entries array"
+                )
+            entries.extend(page_entries)
+            next_page = payload.get("nextPage")
+            if not next_page:
+                return {"entries": entries, "nextPage": None, "total": len(entries)}
+            if not isinstance(next_page, str):
+                raise MigrationError(
+                    "Sigma CLI data-model elements nextPage is not a string"
+                )
+            if next_page in seen_pages:
+                raise MigrationError(
+                    "Sigma CLI data-model elements repeated a pagination cursor"
+                )
+            seen_pages.add(next_page)
+            page = next_page
 
     def create_data_model(self, spec: dict[str, Any]) -> dict[str, Any]:
         return self._run(
@@ -146,11 +207,13 @@ def parse_model_ref(value: str) -> str:
     if "://" not in value:
         return value
     parsed = urllib.parse.urlparse(value)
-    slug = parsed.path.rsplit("/", 1)[-1]
-    public_id = re.search(r"([A-Za-z0-9]{20,})$", slug)
-    if not public_id:
-        raise MigrationError(f"could not extract a data-model ID from {value!r}")
-    return public_id.group(1)
+    # Scan path segments back-to-front so trailing `/edit` (or other suffix
+    # segments) don't shadow the actual public ID segment.
+    for segment in reversed(parsed.path.split("/")):
+        public_id = re.search(r"([A-Za-z0-9]{20,})$", segment)
+        if public_id:
+            return public_id.group(1)
+    raise MigrationError(f"could not extract a data-model ID from {value!r}")
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -441,47 +504,51 @@ def resolve_sources(
         if element is None:
             raise MigrationError(f"mapping references unknown CSV element {element_id}")
         source_connection_id = element["source"].get("connectionId")
-        if not isinstance(source_connection_id, str) or not source_connection_id:
-            raise MigrationError(f"CSV element {element_id} has no connectionId")
         target_connection_id = mapping["targetConnectionId"]
 
-        if source_connection_id not in source_connections:
-            source_connections[source_connection_id] = (
-                source_client.get_connection(source_connection_id)
-            )
         if target_connection_id not in target_connections:
             target_connections[target_connection_id] = (
                 target_client.get_connection(target_connection_id)
             )
-        source_connection = source_connections[source_connection_id]
         target_connection = target_connections[target_connection_id]
-        if source_connection.get("type") != "databricks":
-            raise MigrationError(
-                f"source connection {source_connection_id} is not Databricks"
-            )
         if target_connection.get("type") != "databricks":
             raise MigrationError(
                 f"target connection {target_connection_id} is not Databricks"
             )
-        source_host = str(source_connection.get("host", "")).casefold()
-        target_host = str(target_connection.get("host", "")).casefold()
-        if (
-            source_host
-            and target_host
-            and source_host != target_host
-            and not mapping.get("allowDifferentHost", False)
-        ):
-            raise MigrationError(
-                f"CSV element {element_id} resolves on Databricks host "
-                f"{source_connection.get('host')}, but the target connection uses "
-                f"{target_connection.get('host')}; set allowDifferentHost only "
-                "after confirming the physical table is available there"
-            )
+
+        # Input-table stand-ins (see synthesize_input_table_elements) have no
+        # discoverable source connection — Sigma manages their writeback
+        # warehouse transparently. The target is still validated above; only
+        # the cross-org host comparison is unavailable in this case.
+        if isinstance(source_connection_id, str) and source_connection_id:
+            if source_connection_id not in source_connections:
+                source_connections[source_connection_id] = (
+                    source_client.get_connection(source_connection_id)
+                )
+            source_connection = source_connections[source_connection_id]
+            if source_connection.get("type") != "databricks":
+                raise MigrationError(
+                    f"source connection {source_connection_id} is not Databricks"
+                )
+            source_host = str(source_connection.get("host", "")).casefold()
+            target_host = str(target_connection.get("host", "")).casefold()
+            if (
+                source_host
+                and target_host
+                and source_host != target_host
+                and not mapping.get("allowDifferentHost", False)
+            ):
+                raise MigrationError(
+                    f"CSV element {element_id} resolves on Databricks host "
+                    f"{source_connection.get('host')}, but the target connection uses "
+                    f"{target_connection.get('host')}; set allowDifferentHost only "
+                    "after confirming the physical table is available there"
+                )
         discovery = discoveries[element_id]
         resolved.append(
             ResolvedSource(
                 source_element_id=element_id,
-                source_connection_id=source_connection_id,
+                source_connection_id=source_connection_id or "",
                 target_connection_id=target_connection_id,
                 physical_relation=discovery["physicalRelation"],
                 statement=discovery["statement"],
@@ -490,8 +557,95 @@ def resolve_sources(
     return resolved
 
 
+def synthesize_input_table_elements(
+    client: SigmaCliClient, data_model_id: str
+) -> list[dict[str, Any]]:
+    """Build csv-element-shaped stand-ins for input-table sources.
+
+    Input tables (Sigma's CSV-upload-as-writeback-table feature) never show
+    up in the `data-models spec get` code representation's `pages[].elements`
+    at all, unlike legacy `csv-table` sources. We recover them from the
+    `elements list` endpoint instead and fake up a `source.kind == "csv-table"`
+    shape (keyed on the element's own ID rather than a real inodeId, since
+    input tables have no inodeId) so the rest of the pipeline — which was
+    built only against real CSV-table elements — can treat them uniformly.
+    """
+
+    payload = client.list_data_model_elements(data_model_id)
+    synthetic = []
+    for entry in payload.get("entries", []):
+        if entry.get("type") != "input-table":
+            continue
+        element_id = entry.get("elementId")
+        if not isinstance(element_id, str) or not element_id:
+            raise MigrationError("input-table element is missing elementId")
+        name = entry.get("name") or element_id
+        if not isinstance(name, str):
+            raise MigrationError(
+                f"input-table element {element_id} has a non-string name"
+            )
+        columns = []
+        for column_name in entry.get("columns", []):
+            if not isinstance(column_name, str) or not column_name:
+                raise MigrationError(
+                    f"input-table element {element_id} has an invalid column name"
+                )
+            # The generated SQL aliases multi-word columns with underscores
+            # (e.g. display name "Account CSM" -> SQL alias "Account_CSM"),
+            # so the id suffix must match that alias, not the display label.
+            sql_alias = re.sub(r"\s+", "_", column_name.strip())
+            columns.append(
+                {
+                    "id": f"{element_id}/{sql_alias}",
+                    "formula": f"[{name}/{column_name}]",
+                }
+            )
+        synthetic.append(
+            {
+                "id": element_id,
+                "name": name,
+                "kind": "table",
+                "columns": columns,
+                "order": [column["id"] for column in columns],
+                "source": {
+                    "kind": "csv-table",
+                    "inodeId": element_id,
+                    # Input tables have no queryable source connection of
+                    # their own (Sigma manages the writeback warehouse
+                    # transparently); resolve_sources() treats a missing
+                    # connectionId as "unknown, trust the mapping".
+                    "connectionId": None,
+                },
+            }
+        )
+    return synthetic
+
+
 def get_spec(client: SigmaCliClient, model_ref: str) -> dict[str, Any]:
-    return client.get_data_model_spec(parse_model_ref(model_ref))
+    data_model_id = parse_model_ref(model_ref)
+    spec = client.get_data_model_spec(data_model_id)
+    existing_ids = {
+        element.get("id")
+        for element in iter_elements(spec)
+        if isinstance(element.get("id"), str)
+    }
+    synthetic = [
+        element
+        for element in synthesize_input_table_elements(client, data_model_id)
+        if element["id"] not in existing_ids
+    ]
+    if synthetic:
+        pages = spec.setdefault("pages", [])
+        if not pages:
+            pages.append(
+                {
+                    "id": "input-tables",
+                    "name": "Input Tables",
+                    "elements": [],
+                }
+            )
+        pages[0].setdefault("elements", []).extend(synthetic)
+    return spec
 
 
 def print_json(value: dict[str, Any]) -> None:
