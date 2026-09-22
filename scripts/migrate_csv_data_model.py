@@ -130,6 +130,7 @@ class SigmaCliClient:
                 for marker in (
                     "no command at path",
                     "unknown command",
+                    "unrecognized subcommand",
                     "not found",
                     "404",
                 )
