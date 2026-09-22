@@ -343,7 +343,6 @@ def plan_spec(
         raise MigrationError("; ".join(details))
 
     planned = {
-        "kind": "data-model",
         "name": target_name or source_spec.get("name"),
         "folderId": target_folder_id,
         "schemaVersion": source_spec.get("schemaVersion", 1),
